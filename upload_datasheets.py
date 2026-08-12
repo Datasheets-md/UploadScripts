@@ -1,276 +1,182 @@
 #!/usr/bin/env python3
-"""
-Upload PDF datasheets to datasheets.md
+"""Upload PDF datasheets to datasheets.md -- no part numbers needed.
 
-Bulk-uploads PDF files to the datasheets.md service using its "quick upload"
-API. The backend automatically extracts manufacturer, part number, and
-category from each PDF -- no manual metadata is needed.
+Send a folder of PDFs in one request. The parser reads each datasheet, finds
+every part number in its ordering table, and creates a component for each one.
+A datasheet listing 40 orderable variants gives you 40 parts.
 
-Successfully uploaded files are recorded in a local tracking file
-(.uploaded.json by default) so the script can be safely re-run without
-duplicating work.
+The script then waits for parameter extraction to finish on every part, so a
+clean exit means the data is actually ready -- not merely that the upload
+landed.
 
-Requirements:
     pip install requests
+    export DATASHEETS_TOKEN=dsh_...        # datasheets.md -> Integrations -> API
+    python upload_datasheets.py ./my_pdfs
 
-Usage examples:
-    # Preview what would be uploaded (dry run)
-    python upload_datasheets.py --dir ./my_pdfs --dry-run
-
-    # Upload all PDFs in a folder
-    python upload_datasheets.py --dir ./my_pdfs --email user@example.com
-
-    # Upload specific files
-    python upload_datasheets.py --files part1.pdf part2.pdf --email user@example.com
-
-    # Upload as private (default is public)
-    python upload_datasheets.py --dir ./my_pdfs --private
-
-    # Re-upload everything, ignoring the tracking file
-    python upload_datasheets.py --dir ./my_pdfs --all
+The main flow is the three numbered blocks at the bottom. Everything above
+them is argument handling and error reporting.
 """
 
 import argparse
-import getpass
-import json
 import os
 import sys
 import time
+from pathlib import Path
 
 import requests
 
-BASE_URL = "https://datasheets.md"
-LOGIN_URL = f"{BASE_URL}/api/auth/login"
-UPLOAD_URL = f"{BASE_URL}/api/priv_components/"
-DEFAULT_TRACKING_FILE = ".uploaded.json"
+POLL_SECONDS = 20
+MAX_FILES = 500  # server-side cap for one request
+
+JOB_DONE = ("completed", "blocked", "cancelled")
+# unified_status: 0 pending / 1 ready / 2 processing / 3-5 failed.
+BUSY, FAILED = (0, 2), (3, 4, 5)
 
 
-def load_tracking(path):
-    """Load the set of already-uploaded filenames from the tracking file."""
-    if not os.path.exists(path):
-        return set()
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return set(data.get("uploaded", []))
-    except (json.JSONDecodeError, OSError):
-        return set()
+# --------------------------------------------------------------------------
+# setup and error reporting, kept out of the main flow
+# --------------------------------------------------------------------------
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Bulk-upload PDF datasheets to datasheets.md.")
+    p.add_argument("paths", nargs="+", metavar="PATH",
+                   help="PDF files and/or folders containing PDFs")
+    p.add_argument("--private", action="store_true",
+                   help="keep the parts in your workspace (default: public)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="list what would be uploaded, then stop")
+    p.add_argument("--no-wait", action="store_true",
+                   help="exit once the parts exist, without waiting for parameters")
+    p.add_argument("--base-url", default=os.environ.get(
+        "DATASHEETS_URL", "https://datasheets.md"))
+    p.add_argument("--token", default=os.environ.get("DATASHEETS_TOKEN"),
+                   help="personal API token (or set DATASHEETS_TOKEN)")
+    return p.parse_args()
 
 
-def save_tracking(path, uploaded):
-    """Persist the set of uploaded filenames to the tracking file."""
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump({"uploaded": sorted(uploaded)}, f, indent=2)
+def check(r):
+    """Explain the API's error responses instead of dumping a traceback."""
+    if r.ok:
+        return r
+    why = {
+        401: "check your token -- Integrations -> API on datasheets.md issues a dsh_ key",
+        403: "this token cannot write to that workspace",
+        404: "batch upload is not enabled on this server",
+        413: "a file exceeds the 50 MB per-file limit",
+        429: "daily digitisation quota reached -- try again tomorrow",
+        503: "the service is at capacity -- retry later",
+    }.get(r.status_code)
+    sys.exit(f"HTTP {r.status_code}: {why or r.text[:300]}")
 
 
-def get_auth_token(email=None, password=None):
-    """Authenticate with datasheets.md and return a JWT access token."""
-    if not email:
-        email = os.environ.get("DATASHEETS_EMAIL") or input("Email: ").strip()
-    if not password:
-        password = os.environ.get("DATASHEETS_PASSWORD") or getpass.getpass("Password: ").strip()
-    print(f"Logging in as {email}...")
-
-    try:
-        response = requests.post(LOGIN_URL, json={"email": email, "password": password})
-        response.raise_for_status()
-        token = response.json()["access"]
-        print("Login successful!")
-        return token
-    except requests.exceptions.RequestException as e:
-        print(f"Login failed: {e}")
-        if hasattr(e, "response") and e.response is not None:
-            print(f"Server response: {e.response.text}")
-        return None
-    except KeyError:
-        print(f"Login failed: unexpected response format.")
-        print(response.json())
-        return None
+def collect_pdfs(paths):
+    """Expand paths into PDFs. Folders contribute their PDFs regardless of
+    filename case; anything else in a folder is REPORTED, never silently
+    dropped -- a file missing without a word is worse than an error."""
+    pdfs, skipped = [], []
+    for arg in map(Path, paths):
+        if arg.is_dir():
+            for f in sorted(arg.iterdir()):
+                target = pdfs if f.is_file() and f.suffix.lower() == ".pdf" else skipped
+                target.append(f)
+        elif arg.is_file():
+            pdfs.append(arg)  # named explicitly, so trust it
+        else:
+            sys.exit(f"not found: {arg}")
+    if not pdfs:
+        sys.exit(f"no PDFs found in: {' '.join(paths)}")
+    if len(pdfs) > MAX_FILES:
+        sys.exit(f"{len(pdfs)} files exceeds the {MAX_FILES}-per-request cap; "
+                 f"split the folder and run again")
+    return pdfs, skipped
 
 
-def discover_files(directory, already_uploaded, skip_uploaded=True):
-    """Find all PDF files in a directory, optionally skipping already-uploaded ones."""
-    pdf_files = []
-    for name in sorted(os.listdir(directory)):
-        if name.lower().endswith(".pdf"):
-            if skip_uploaded and name in already_uploaded:
-                continue
-            pdf_files.append(name)
-    return pdf_files
+def report_rows(rows):
+    """Per-datasheet outcome, including the ways one can yield nothing."""
+    for row in rows:
+        name = row["resolved"]["filename"]
+        confirm = row["resolved"].get("confirm") or {}
+        found = confirm.get("created", [])
+        print(f"      {name}: {row['status']}, {len(found)} part numbers {found[:5]}")
+        if row.get("error"):
+            print(f"        error: {row['error']}")
+        for label in ("rejected", "conflicts", "already_in_workspace"):
+            if confirm.get(label):
+                print(f"        {label}: {confirm[label][:5]}")
 
 
-def upload_files(token, directory, files, *, tracking_path, already_uploaded,
-                 is_public=True, delay=2, batch_size=10, batch_pause=30):
-    """Upload PDF files to datasheets.md.
+# --------------------------------------------------------------------------
+# main flow
+# --------------------------------------------------------------------------
 
-    Args:
-        token:            JWT access token.
-        directory:        Folder containing the PDFs.
-        files:            List of filenames to upload.
-        tracking_path:    Path to the JSON tracking file.
-        already_uploaded: Mutable set of already-uploaded filenames (updated in place).
-        is_public:        Whether to mark uploads as public.
-        delay:            Seconds to wait between individual uploads.
-        batch_size:       Number of uploads before a longer pause.
-        batch_pause:      Seconds to wait after each batch.
-    """
-    headers = {"Authorization": f"Bearer {token}"}
-    success_count = 0
-    fail_count = 0
+args = parse_args()
+pdfs, skipped = collect_pdfs(args.paths)
+for f in skipped:
+    print(f"      skipping (not a .pdf): {f.name}")
 
-    print(f"\nUploading {len(files)} file(s) to {UPLOAD_URL}")
-    print(f"Visibility: {'public' if is_public else 'private'}")
-    print(f"Pacing: {delay}s between files, {batch_pause}s every {batch_size} files")
-    print("-" * 60)
+if args.dry_run:  # before the token check -- a dry run needs no credentials
+    print(f"would upload {len(pdfs)} pdf(s):")
+    for p in pdfs:
+        print(f"  - {p}")
+    sys.exit(0)
 
-    for i, filename in enumerate(files, 1):
-        file_path = os.path.join(directory, filename)
+if not args.token:
+    sys.exit("No token. Set DATASHEETS_TOKEN=dsh_... or pass --token.\n"
+             "Create one at https://datasheets.md/integrations/api")
 
-        if not os.path.exists(file_path):
-            print(f"[{i}/{len(files)}] SKIP (not found): {file_path}")
-            fail_count += 1
-            continue
+s = requests.Session()
+s.headers["Authorization"] = f"Bearer {args.token}"
 
-        print(f"[{i}/{len(files)}] Uploading {filename}...", end=" ", flush=True)
+# 1. Upload. Every file is hashed, deduplicated and staged before anything is
+#    written, so an interrupted upload leaves no half-finished job behind.
+print(f"[1/3] uploading {len(pdfs)} pdf(s)...")
+files = [("files", (p.name, p.open("rb"), "application/pdf")) for p in pdfs]
+r = check(s.post(f"{args.base_url}/api/priv_components/batch/datasheets/",
+                 files=files,
+                 data={"is_public": "false" if args.private else "true"}))
+job = r.json()["job_uuid"]
+print(f"      upload complete, {len(pdfs)}/{len(pdfs)} staged. job {job}")
 
-        form_data = {}
-        if is_public:
-            form_data["is_public"] = "true"
+# 2. The upload is done; everything below is server-side progress. Several
+#    datasheets are parsed at once, but they are committed strictly in order so
+#    that two datasheets from the same family cannot create duplicate parts. A
+#    datasheet stays "parsing or queued" until its parts are created, so early
+#    polls showing no progress are normal -- a large PDF can take a few minutes.
+print("[2/3] processing datasheets (parse -> discover part numbers)")
+while True:
+    d = check(s.get(f"{args.base_url}/api/priv_components/batch/{job}/")).json()
+    c = d["counts"]
+    print(f"      part numbers discovered in {c.get('created', 0)}/{d['total']}"
+          f" datasheets | {c.get('pending', 0)} parsing or queued"
+          f" | {c.get('failed', 0)} failed")
+    if d["status"] in JOB_DONE:
+        break
+    time.sleep(POLL_SECONDS)
 
-        try:
-            with open(file_path, "rb") as f:
-                resp = requests.post(
-                    UPLOAD_URL,
-                    headers=headers,
-                    data=form_data,
-                    files={"datasheet_file": (filename, f, "application/pdf")},
-                )
+print(f"      job {d['status']}"
+      + (f" -- {d['blocked_reason']}" if d.get("blocked_reason") else ""))
+report_rows(d["rows"])
 
-            if resp.status_code in (200, 201):
-                uuid = resp.json().get("private_component_uuid", "N/A")
-                print(f"OK (uuid: {uuid})")
-                success_count += 1
-                already_uploaded.add(filename)
-                save_tracking(tracking_path, already_uploaded)
-            else:
-                print(f"FAILED ({resp.status_code})")
-                print(f"  {resp.text[:200]}")
-                fail_count += 1
+if args.no_wait:
+    sys.exit(0)
 
-        except Exception as e:
-            print(f"ERROR: {e}")
-            fail_count += 1
-
-        # Pacing
-        if i < len(files):
-            if i % batch_size == 0:
-                print(f"\n--- Batch pause ({batch_pause}s) ---\n")
-                time.sleep(batch_pause)
-            else:
-                time.sleep(delay)
-
-    print("-" * 60)
-    print(f"Done. Success: {success_count}, Failed: {fail_count}, Total: {len(files)}")
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Upload PDF datasheets to datasheets.md (metadata auto-extracted)"
-    )
-    parser.add_argument(
-        "--dir", default=".",
-        help="Directory containing PDFs to upload (default: current directory)"
-    )
-    parser.add_argument(
-        "--files", nargs="+",
-        help="Upload specific files instead of scanning a directory"
-    )
-    parser.add_argument(
-        "--tracking-file", default=DEFAULT_TRACKING_FILE,
-        help=f"JSON file tracking uploaded filenames (default: {DEFAULT_TRACKING_FILE})"
-    )
-    parser.add_argument(
-        "--all", action="store_true",
-        help="Upload all PDFs, ignoring the tracking file"
-    )
-    parser.add_argument(
-        "--private", action="store_true",
-        help="Upload as private (default is public)"
-    )
-    parser.add_argument(
-        "--delay", type=float, default=2,
-        help="Seconds between uploads (default: 2)"
-    )
-    parser.add_argument(
-        "--batch-size", type=int, default=10,
-        help="Files per batch before a longer pause (default: 10)"
-    )
-    parser.add_argument(
-        "--batch-pause", type=float, default=30,
-        help="Seconds to pause between batches (default: 30)"
-    )
-    parser.add_argument(
-        "--dry-run", action="store_true",
-        help="List files that would be uploaded without uploading"
-    )
-    parser.add_argument(
-        "--email",
-        help="Login email (or set DATASHEETS_EMAIL env var)"
-    )
-    parser.add_argument(
-        "--password",
-        help="Login password (or set DATASHEETS_PASSWORD env var)"
-    )
-
-    args = parser.parse_args()
-
-    # Resolve tracking file path (store next to the PDF directory)
-    if os.path.isabs(args.tracking_file):
-        tracking_path = args.tracking_file
-    else:
-        tracking_path = os.path.join(args.dir, args.tracking_file)
-
-    already_uploaded = load_tracking(tracking_path) if not args.all else set()
-
-    # Build file list
-    if args.files:
-        files = args.files
-    else:
-        if not os.path.isdir(args.dir):
-            print(f"Error: directory not found: {args.dir}")
-            sys.exit(1)
-        files = discover_files(args.dir, already_uploaded, skip_uploaded=not args.all)
-
-    if not files:
-        print("No files to upload.")
-        sys.exit(0)
-
-    print(f"Found {len(files)} file(s) to upload from: {os.path.abspath(args.dir)}")
-    if already_uploaded:
-        print(f"({len(already_uploaded)} file(s) previously uploaded — skipped)")
-    for f in files:
-        print(f"  - {f}")
-
-    if args.dry_run:
-        print("\n(Dry run -- nothing uploaded)")
-        sys.exit(0)
-
-    token = get_auth_token(email=args.email, password=args.password)
-    if not token:
-        sys.exit(1)
-
-    upload_files(
-        token=token,
-        directory=args.dir,
-        files=files,
-        tracking_path=tracking_path,
-        already_uploaded=already_uploaded,
-        is_public=not args.private,
-        delay=args.delay,
-        batch_size=args.batch_size,
-        batch_pause=args.batch_pause,
-    )
-
-
-if __name__ == "__main__":
-    main()
+# 3. The parts exist now, but their parameters are still being extracted, and
+#    the first part of a family finishes before the rest. Check every part.
+print("[3/3] extracting parameters (every part, not just the first in the family)")
+for row in d["rows"]:
+    if not row["component_uuid"]:
+        continue
+    name = row["resolved"]["filename"]
+    while True:
+        members = check(s.get(f"{args.base_url}/api/priv_components/",
+                              params={"siblings_of": row["component_uuid"],
+                                      "limit": 100})).json()["components"]
+        busy = [m for m in members if m["unified_status"] in BUSY]
+        print(f"      {name}: {len(members) - len(busy)}/{len(members)} parts ready")
+        if not busy:
+            break
+        time.sleep(POLL_SECONDS)
+    failed = [m["part_number"] for m in members if m["unified_status"] in FAILED]
+    if failed:
+        print(f"      {name}: {len(failed)} FAILED: {failed[:5]}")
