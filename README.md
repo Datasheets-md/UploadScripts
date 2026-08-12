@@ -22,8 +22,14 @@ Python 3.9 or newer.
 
 ### Get a token
 
-Sign in to datasheets.md and go to **Integrations → API**
-([datasheets.md/integrations/api](https://datasheets.md/integrations/api)) to
+> **Switch to the workspace you want to upload into before creating the token.**
+> A token is permanently bound to whichever workspace was active when you
+> generated it, and that workspace is where every upload lands. See
+> [Tokens are workspace-scoped](#tokens-are-workspace-scoped) below.
+
+Sign in to datasheets.md, switch to your target workspace, then go to
+**Integrations → API**
+([datasheets.md/integrations/api](https://datasheets.md/integrations/api)) and
 generate a personal token. It looks like `dsh_...`.
 
 ```bash
@@ -32,6 +38,30 @@ export DATASHEETS_TOKEN=dsh_your_token_here
 
 The token is shown once, so store it somewhere safe. Treat it like a password
 and keep it out of version control.
+
+### Tokens are workspace-scoped
+
+A personal API token is bound to **exactly one workspace** — the one that was
+active when you created it. That binding decides where your uploads go:
+
+- Everything this script creates lands in the token's workspace.
+- The binding is fixed at creation and **cannot be changed or overridden**. The
+  server ignores any workspace sent by a client, so there is no flag on this
+  script to redirect uploads elsewhere. The token alone decides.
+- To upload into a different workspace, switch to it in the web app and generate
+  a **second token**. Keep the two apart — the only visible difference is the
+  workspace you were in when each was created.
+
+Integrations → API lists **only the tokens belonging to the workspace you are
+currently in**. So if a token you created is not in the list, you are looking at
+a different workspace — switch workspace and check again.
+
+That also means the page cannot tell you which workspace an unlabelled token
+came from. Name tokens after their workspace (`upload-acme-prod`,
+`upload-scratch`) so they stay distinguishable later, especially if you run
+uploads on a schedule.
+
+If parts land somewhere unexpected, the token is almost always the reason.
 
 ### Quick start
 
@@ -118,7 +148,8 @@ local tracking file to keep in sync.
 | Message | What it means |
 |---|---|
 | `HTTP 401` | Token missing, mistyped or revoked. Generate a new one. |
-| `HTTP 403` | The token cannot write to that workspace. |
+| `HTTP 403` | The token's workspace is gone, or your access to it was removed. |
+| Parts in the wrong workspace | The token decides the destination. Create a token while in the workspace you want. |
 | `HTTP 404` | Batch upload is not enabled on this server. |
 | `HTTP 413` | A single file is over 50 MB. |
 | `HTTP 429` | Daily digitisation limit reached. Try again tomorrow. |
