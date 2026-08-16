@@ -85,15 +85,20 @@ python upload_datasheets.py --private ./my_pdfs
 [1/3] uploading 2 pdf(s)...
       upload complete, 2/2 staged. job 059005ca-e68e-427e-9ece-d476fda418f3
 [2/3] processing datasheets (parse -> discover part numbers)
-      part numbers discovered in 0/2 datasheets | 2 parsing or queued | 0 failed
-      part numbers discovered in 1/2 datasheets | 1 parsing or queued | 0 failed
-      part numbers discovered in 2/2 datasheets | 0 parsing or queued | 0 failed
+      part numbers discovered in 0/2 datasheets | 2 parsing or queued | 0 duplicate | 0 failed
+      part numbers discovered in 1/2 datasheets | 1 parsing or queued | 0 duplicate | 0 failed
+      part numbers discovered in 2/2 datasheets | 0 parsing or queued | 0 duplicate | 0 failed
       job completed
-      MCP6006.pdf: created, 1 part numbers ['MCP6006T-E/LT']
+      MCP6006.pdf: created, 25 part numbers ['MCP6006T-E/OT', ...]
       AP7343.pdf: created, 40 part numbers ['AP7343-09FS4-7B', ...]
-[3/3] extracting parameters (every part, not just the first in the family)
-      AP7343.pdf: 130/130 parts ready
+[3/3] extracting parameters (65 parts, every family member)
+      52/65 parts ready
+      65/65 parts ready
 ```
+
+`duplicate` counts files that were byte-identical to an earlier file in the same
+upload. They are skipped rather than parsed twice, and the four numbers always
+add up to the total.
 
 The three phases:
 
@@ -102,7 +107,12 @@ The three phases:
    leaves no half-finished job behind.
 2. **Processing** — each datasheet is parsed and its part numbers become
    components.
-3. **Parameters** — extraction runs on every part that was created.
+3. **Parameters** — extraction runs on every part that was created, and the
+   script waits for all of them. One datasheet mints a whole family, so this
+   covers every part number the upload produced, not just one per file.
+
+   This works the same whether you published the parts or kept them private
+   with `--private`.
 
 ### Why progress can look stalled
 
