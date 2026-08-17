@@ -13,6 +13,9 @@ landed.
     export DATASHEETS_TOKEN=dsh_...        # datasheets.md -> Integrations -> API
     python upload_datasheets.py ./my_pdfs
 
+Everything here goes through the public API at /api-service, the same surface
+documented at https://datasheets.md/api-service/api/docs.
+
 The main flow is the three numbered blocks at the bottom. Everything above
 them is argument handling and error reporting.
 """
@@ -26,11 +29,10 @@ from pathlib import Path
 import requests
 
 POLL_SECONDS = 20
-MAX_FILES = 500  # server-side cap for one request
+MAX_FILES = 500      # server-side cap for one request
+PAGE = 500           # workspace listing page size (server max)
 
 JOB_DONE = ("completed", "blocked", "cancelled")
-# unified_status: 0 pending / 1 ready / 2 processing / 3-5 failed.
-BUSY, FAILED = (0, 2), (3, 4, 5)
 
 
 # --------------------------------------------------------------------------
@@ -64,6 +66,7 @@ def check(r):
         403: "this token cannot write to that workspace",
         404: "batch upload is not enabled on this server",
         413: "a file exceeds the 50 MB per-file limit",
+        422: "the server rejected a file as not a PDF",
         429: "daily digitisation quota reached -- try again tomorrow",
         503: "the service is at capacity -- retry later",
     }.get(r.status_code)
@@ -106,6 +109,54 @@ def report_rows(rows):
                 print(f"        {label}: {confirm[label][:5]}")
 
 
+def minted_part_numbers(rows):
+    """Every part number this job put in your workspace, across all datasheets.
+    One PDF mints a whole family, so this is what must be waited on -- not just
+    the row's own component.
+
+    Both outcomes count. `created` is a part this job minted; `linked` is one
+    whose datasheet was already in the public catalog, so the job attached the
+    existing part instead of digitising it again. Either way it is a new part
+    in your workspace with its own uuid, and waiting on only the first would
+    silently skip a whole upload whose datasheets were all already known."""
+    pns = []
+    for row in rows:
+        confirm = row["resolved"].get("confirm") or {}
+        pns.extend(confirm.get("created", []))
+        pns.extend(confirm.get("linked", []))
+    return pns
+
+
+def workspace_index(s, api):
+    """part number -> workspace component uuid, for every part you own.
+
+    A batch reports one component per file, but a datasheet mints a whole
+    family, so the parts are found by name instead."""
+    index, offset = {}, 0
+    while True:
+        page = check(s.get(f"{api}/api/workspace/components",
+                           params={"limit": PAGE, "offset": offset})).json()
+        for c in page:
+            if c.get("part_number"):
+                index[c["part_number"]] = c["uuid"]
+        if len(page) < PAGE:
+            return index
+        offset += PAGE
+
+
+def extraction_state(s, api, uuid):
+    """ready / processing / failed for one part, or None if the server does not
+    know it. 404 is an answer here, not a fatal error, so this does not go
+    through check().
+
+    Your token is bound to one workspace, so the endpoint resolves the part
+    from the uuid alone -- public and purely private uploads alike."""
+    r = s.get(f"{api}/api/components/{uuid}/status")
+    if r.status_code == 404:
+        return None
+    return check(r).json().get("status")
+
+
 # --------------------------------------------------------------------------
 # main flow
 # --------------------------------------------------------------------------
@@ -125,6 +176,7 @@ if not args.token:
     sys.exit("No token. Set DATASHEETS_TOKEN=dsh_... or pass --token.\n"
              "Create one at https://datasheets.md/integrations/api")
 
+api = f"{args.base_url.rstrip('/')}/api-service"
 s = requests.Session()
 s.headers["Authorization"] = f"Bearer {args.token}"
 
@@ -132,7 +184,7 @@ s.headers["Authorization"] = f"Bearer {args.token}"
 #    written, so an interrupted upload leaves no half-finished job behind.
 print(f"[1/3] uploading {len(pdfs)} pdf(s)...")
 files = [("files", (p.name, p.open("rb"), "application/pdf")) for p in pdfs]
-r = check(s.post(f"{args.base_url}/api/priv_components/batch/datasheets/",
+r = check(s.post(f"{api}/api/components/batch",
                  files=files,
                  data={"is_public": "false" if args.private else "true"}))
 job = r.json()["job_uuid"]
@@ -145,11 +197,14 @@ print(f"      upload complete, {len(pdfs)}/{len(pdfs)} staged. job {job}")
 #    polls showing no progress are normal -- a large PDF can take a few minutes.
 print("[2/3] processing datasheets (parse -> discover part numbers)")
 while True:
-    d = check(s.get(f"{args.base_url}/api/priv_components/batch/{job}/")).json()
+    d = check(s.get(f"{api}/api/components/batch/{job}")).json()
     c = d["counts"]
+    # `skipped` is a byte-identical duplicate of an earlier file in this same
+    # batch. Printed so the four numbers always add up to the total -- a
+    # datasheet silently missing from the tally reads like a bug.
     print(f"      part numbers discovered in {c.get('created', 0)}/{d['total']}"
           f" datasheets | {c.get('pending', 0)} parsing or queued"
-          f" | {c.get('failed', 0)} failed")
+          f" | {c.get('skipped', 0)} duplicate | {c.get('failed', 0)} failed")
     if d["status"] in JOB_DONE:
         break
     time.sleep(POLL_SECONDS)
@@ -158,25 +213,58 @@ print(f"      job {d['status']}"
       + (f" -- {d['blocked_reason']}" if d.get("blocked_reason") else ""))
 report_rows(d["rows"])
 
-if args.no_wait:
+# 3. The parts exist now, but their parameters are still being extracted, and
+#    the first part of a family finishes before the rest. Every part number the
+#    job put in your workspace is checked, not just the one component each row
+#    reports.
+wanted = minted_part_numbers(d["rows"])
+if not wanted:
     sys.exit(0)
 
-# 3. The parts exist now, but their parameters are still being extracted, and
-#    the first part of a family finishes before the rest. Check every part.
-print("[3/3] extracting parameters (every part, not just the first in the family)")
-for row in d["rows"]:
-    if not row["component_uuid"]:
-        continue
-    name = row["resolved"]["filename"]
-    while True:
-        members = check(s.get(f"{args.base_url}/api/priv_components/",
-                              params={"siblings_of": row["component_uuid"],
-                                      "limit": 100})).json()["components"]
-        busy = [m for m in members if m["unified_status"] in BUSY]
-        print(f"      {name}: {len(members) - len(busy)}/{len(members)} parts ready")
-        if not busy:
-            break
+# Resolved before --no-wait returns, so the uuids are reported either way.
+#
+# These are WORKSPACE component uuids -- your private copy of each part -- and
+# that is deliberate: a public upload publishes to the community catalog AND
+# puts a copy in your library. The community part is a different row with a
+# different uuid that you do not own, so the workspace uuid is the one to keep
+# in both modes. It is what every other endpoint here takes.
+index = workspace_index(s, api)
+found = {pn: index[pn] for pn in wanted if pn in index}
+missing = sorted(pn for pn in wanted if pn not in index)
+
+
+def report_parts():
+    print(f"      {len(found)} part(s) in your workspace:")
+    for part_number in sorted(found):
+        print(f"        {found[part_number]}  {part_number}")
+    # Reported rather than counted as done: claiming a part is ready when it
+    # was never checked is the one outcome worth avoiding.
+    if missing:
+        print(f"      {len(missing)} part(s) not found in your workspace, "
+              f"not checked: {missing[:5]}")
+
+
+if args.no_wait:
+    report_parts()
+    sys.exit(0)
+
+print(f"[3/3] extracting parameters ({len(wanted)} parts, every family member)")
+failed = []
+pending = dict(found)
+while pending:
+    still = {}
+    for pn, uuid in pending.items():
+        state = extraction_state(s, api, uuid)
+        if state == "failed":
+            failed.append(pn)
+        elif state != "ready":
+            still[pn] = uuid
+    print(f"      {len(wanted) - len(still) - len(missing)}"
+          f"/{len(wanted) - len(missing)} parts ready")
+    pending = still
+    if pending:
         time.sleep(POLL_SECONDS)
-    failed = [m["part_number"] for m in members if m["unified_status"] in FAILED]
-    if failed:
-        print(f"      {name}: {len(failed)} FAILED: {failed[:5]}")
+
+report_parts()
+if failed:
+    print(f"      {len(failed)} FAILED: {failed[:5]}")
