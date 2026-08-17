@@ -110,13 +110,20 @@ def report_rows(rows):
 
 
 def minted_part_numbers(rows):
-    """Every part number the job created, across all datasheets. One PDF mints
-    a whole family, so this is what must be waited on -- not just the row's
-    own component."""
+    """Every part number this job put in your workspace, across all datasheets.
+    One PDF mints a whole family, so this is what must be waited on -- not just
+    the row's own component.
+
+    Both outcomes count. `created` is a part this job minted; `linked` is one
+    whose datasheet was already in the public catalog, so the job attached the
+    existing part instead of digitising it again. Either way it is a new part
+    in your workspace with its own uuid, and waiting on only the first would
+    silently skip a whole upload whose datasheets were all already known."""
     pns = []
     for row in rows:
         confirm = row["resolved"].get("confirm") or {}
         pns.extend(confirm.get("created", []))
+        pns.extend(confirm.get("linked", []))
     return pns
 
 
@@ -206,22 +213,44 @@ print(f"      job {d['status']}"
       + (f" -- {d['blocked_reason']}" if d.get("blocked_reason") else ""))
 report_rows(d["rows"])
 
-if args.no_wait:
-    sys.exit(0)
-
 # 3. The parts exist now, but their parameters are still being extracted, and
 #    the first part of a family finishes before the rest. Every part number the
-#    job minted is checked, not just the one component each row reports.
+#    job put in your workspace is checked, not just the one component each row
+#    reports.
 wanted = minted_part_numbers(d["rows"])
 if not wanted:
     sys.exit(0)
 
-print(f"[3/3] extracting parameters ({len(wanted)} parts, every family member)")
+# Resolved before --no-wait returns, so the uuids are reported either way.
+#
+# These are WORKSPACE component uuids -- your private copy of each part -- and
+# that is deliberate: a public upload publishes to the community catalog AND
+# puts a copy in your library. The community part is a different row with a
+# different uuid that you do not own, so the workspace uuid is the one to keep
+# in both modes. It is what every other endpoint here takes.
 index = workspace_index(s, api)
-pending = {pn: index[pn] for pn in wanted if pn in index}
+found = {pn: index[pn] for pn in wanted if pn in index}
 missing = sorted(pn for pn in wanted if pn not in index)
 
+
+def report_parts():
+    print(f"      {len(found)} part(s) in your workspace:")
+    for part_number in sorted(found):
+        print(f"        {found[part_number]}  {part_number}")
+    # Reported rather than counted as done: claiming a part is ready when it
+    # was never checked is the one outcome worth avoiding.
+    if missing:
+        print(f"      {len(missing)} part(s) not found in your workspace, "
+              f"not checked: {missing[:5]}")
+
+
+if args.no_wait:
+    report_parts()
+    sys.exit(0)
+
+print(f"[3/3] extracting parameters ({len(wanted)} parts, every family member)")
 failed = []
+pending = dict(found)
 while pending:
     still = {}
     for pn, uuid in pending.items():
@@ -236,10 +265,6 @@ while pending:
     if pending:
         time.sleep(POLL_SECONDS)
 
-# Reported rather than counted as done: claiming a part is ready when it was
-# never checked is the one outcome worth avoiding.
-if missing:
-    print(f"      {len(missing)} part(s) not found in your workspace, "
-          f"not checked: {missing[:5]}")
+report_parts()
 if failed:
     print(f"      {len(failed)} FAILED: {failed[:5]}")
