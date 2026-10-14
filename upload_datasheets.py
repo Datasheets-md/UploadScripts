@@ -31,6 +31,21 @@ from pathlib import Path
 
 import requests
 
+# ================================ CONFIG ================================
+# Fill these in, or leave them and set the environment variables of the same
+# name (DATASHEETS_URL, DATASHEETS_TOKEN), or pass --base-url / --token.
+# A command-line flag wins over the environment, the environment over this.
+
+# The address you reach the API at: scheme + host, no trailing slash.
+# Self-hosted: your own, e.g. "https://datasheets.example.com".
+DATASHEETS_URL = "https://api.datasheets.md"
+
+# Your personal API token (dsh_...), from Integrations -> API in the web app.
+# It decides which workspace the uploads land in. Keep this file private once
+# a real token is in it.
+DATASHEETS_TOKEN = ""
+# ========================================================================
+
 POLL_SECONDS = 20
 MAX_FILES = 500        # server-side cap for one job
 PARALLEL_UPLOADS = 4   # PUTs to the object store at once
@@ -53,11 +68,10 @@ def parse_args():
                    help="list what would be uploaded, then stop")
     p.add_argument("--no-wait", action="store_true",
                    help="exit once the parts exist, without waiting for parameters")
-    p.add_argument("--base-url", default=os.environ.get(
-        "DATASHEETS_URL", "https://api.datasheets.md"),
-        help="API origin (or set DATASHEETS_URL); self-hosted: the address "
-             "you reach the API at, e.g. https://datasheets.example.com")
-    p.add_argument("--token", default=os.environ.get("DATASHEETS_TOKEN"),
+    p.add_argument("--base-url", default=os.environ.get("DATASHEETS_URL") or DATASHEETS_URL,
+                   help="API origin (or set DATASHEETS_URL); self-hosted: the address "
+                        "you reach the API at, e.g. https://datasheets.example.com")
+    p.add_argument("--token", default=os.environ.get("DATASHEETS_TOKEN") or DATASHEETS_TOKEN or None,
                    help="personal API token (or set DATASHEETS_TOKEN)")
     return p.parse_args()
 
@@ -224,7 +238,8 @@ if args.dry_run:  # before the token check -- a dry run needs no credentials
     sys.exit(0)
 
 if not args.token:
-    sys.exit("No token. Set DATASHEETS_TOKEN=dsh_... or pass --token.\n"
+    sys.exit("No token. Fill DATASHEETS_TOKEN at the top of this script, set the\n"
+             "DATASHEETS_TOKEN environment variable, or pass --token.\n"
              "Create one at https://datasheets.md/integrations/api")
 
 api = f"{args.base_url.rstrip('/')}/api/v1"

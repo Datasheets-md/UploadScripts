@@ -40,6 +40,10 @@ generate a personal token. It looks like `dsh_...`.
 export DATASHEETS_TOKEN=dsh_your_token_here
 ```
 
+Or paste it into `DATASHEETS_TOKEN` in the CONFIG block at the top of the
+script (and `DATASHEETS_URL` for a self-hosted instance). The environment
+variable and the `--token` / `--base-url` flags override that block.
+
 The token is shown once, so store it somewhere safe. Treat it like a password
 and keep it out of version control.
 
