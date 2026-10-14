@@ -12,6 +12,10 @@ a component for each one. A datasheet listing 40 orderable variants gives you
 The script then waits for parameter extraction to finish on every part, so when
 it exits cleanly the data is genuinely ready — not merely uploaded.
 
+The PDFs go straight to the object store through presigned URLs; the API hands
+out the URLs and registers what arrived. The same script works against a
+self-hosted instance — see [Self-hosted instances](#self-hosted-instances).
+
 ### Requirements
 
 ```bash
@@ -35,6 +39,10 @@ generate a personal token. It looks like `dsh_...`.
 ```bash
 export DATASHEETS_TOKEN=dsh_your_token_here
 ```
+
+Or paste it into `DATASHEETS_TOKEN` in the CONFIG block at the top of the
+script (and `DATASHEETS_URL` for a self-hosted instance). The environment
+variable and the `--token` / `--base-url` flags override that block.
 
 The token is shown once, so store it somewhere safe. Treat it like a password
 and keep it out of version control.
@@ -102,9 +110,10 @@ add up to the total.
 
 The three phases:
 
-1. **Upload** — all files go in a single request. Every file is hashed,
-   deduplicated and staged before anything is written, so an interrupted upload
-   leaves no half-finished job behind.
+1. **Upload** — the script asks for one presigned URL per file, uploads the
+   files straight to the object store (four at a time), then registers them as
+   one import job. Nothing is created until that last step, so an interrupted
+   upload leaves no half-finished job behind.
 2. **Processing** — each datasheet is parsed and its part numbers become
    components.
 3. **Parameters** — extraction runs on every part that was created, and the
@@ -140,7 +149,7 @@ local tracking file to keep in sync.
 | `--private` | off | Keep parts in your workspace; default publishes them |
 | `--dry-run` | off | List what would be uploaded, then stop. No token needed |
 | `--no-wait` | off | Exit once parts exist, without waiting for parameters |
-| `--base-url` | `https://datasheets.md` | Or set `DATASHEETS_URL` |
+| `--base-url` | `https://api.datasheets.md` | The API's address. Or set `DATASHEETS_URL` |
 | `--token` | | Or set `DATASHEETS_TOKEN` |
 
 ### Notes on file selection
@@ -150,8 +159,12 @@ local tracking file to keep in sync.
 - Anything in a folder that is not a `.pdf` is listed as skipped rather than
   silently ignored — check that line if a file you expected is missing.
 - A file named directly on the command line is uploaded whatever its extension.
-- Limits are 500 files per request and 50 MB per file. Split larger sets and run
+- Limits are 500 files per run and 50 MB per file. Split larger sets and run
   the script more than once.
+- Every presigned URL is valid for 15 minutes, and all uploads of a run must
+  finish inside that window. On a slow connection, upload fewer files per run.
+- Two files with the same name cannot go in one run, even from different
+  folders. The script stops and names them.
 
 ### Troubleshooting
 
@@ -160,13 +173,29 @@ local tracking file to keep in sync.
 | `HTTP 401` | Token missing, mistyped or revoked. Generate a new one. |
 | `HTTP 403` | The token's workspace is gone, or your access to it was removed. |
 | Parts in the wrong workspace | The token decides the destination. Create a token while in the workspace you want. |
-| `HTTP 404` | Batch upload is not enabled on this server. |
+| `HTTP 404` | Batch upload is not enabled on this server, or the server is older than presigned uploads. |
 | `HTTP 413` | A single file is over 50 MB. |
 | `HTTP 429` | Daily digitisation limit reached. Try again tomorrow. |
-| `HTTP 503` | The service is at capacity. Retry later. |
+| `HTTP 503 ... UPLOADS_NOT_CONFIGURED` | Self-hosted: the server has no public object-store address. Set `MINIO_PUBLIC_ENDPOINT` (see below). |
+| `HTTP 503` (anything else) | The service is at capacity. Retry later. |
+| `upload of X failed: HTTP 403` | The presigned URL expired (upload fewer files per run), or, self-hosted, `MINIO_PUBLIC_ENDPOINT` is not the address this machine reaches the server at. |
+| `upload of X failed: HTTP 404` | Self-hosted: the router does not send `/api/s3/` to the object store. Update the nginx configuration. |
 | `no PDFs found in: ...` | The folder held no `.pdf` files. Check the skipped lines. |
 | `job blocked -- workspace_parts` | Your plan's part limit was reached. Parts already created are kept. |
 | `0 part numbers` on a row | The parser found no ordering table. The datasheet is stored, but no parts were created from it. |
+
+### Self-hosted instances
+
+Point `--base-url` at the address you reach the API at:
+
+```bash
+python upload_datasheets.py --base-url https://datasheets.example.com ./my_pdfs
+```
+
+The upload URLs the server hands out are built from its `MINIO_PUBLIC_ENDPOINT`
+setting, so that must be the same address, scheme and port included. The
+server's router must also forward `/api/s3/` to the object store. Both come
+with the current deployment bundle.
 
 ### A note on cost
 
